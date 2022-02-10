@@ -37,6 +37,8 @@ from tool.tv_reference.utils import collate_fn as val_collate
 from tool.tv_reference.coco_utils import convert_to_coco_api
 from tool.tv_reference.coco_eval import CocoEvaluator
 
+from pathlib import Path
+
 
 def bboxes_iou(bboxes_a, bboxes_b, xyxy=True, GIoU=False, DIoU=False, CIoU=False):
     """Calculate the Intersection of Unions (IoUs) between bounding boxes.
@@ -131,7 +133,7 @@ class Yolo_loss(nn.Module):
     def __init__(self, n_classes=80, n_anchors=3, device=None, batch=2):
         super(Yolo_loss, self).__init__()
         self.device = device
-        self.strides = [8, 16, 32]
+        self.strides = [32, 16] #[8, 16, 32]
         image_size = 608
         self.n_classes = n_classes
         self.n_anchors = n_anchors
@@ -142,7 +144,7 @@ class Yolo_loss(nn.Module):
 
         self.masked_anchors, self.ref_anchors, self.grid_x, self.grid_y, self.anchor_w, self.anchor_h = [], [], [], [], [], []
 
-        for i in range(3):
+        for i in range(2):
             all_anchors_grid = [(w / self.strides[i], h / self.strides[i]) for w, h in self.anchors]
             masked_anchors = np.array([all_anchors_grid[j] for j in self.anch_masks[i]], dtype=np.float32)
             ref_anchors = np.zeros((len(all_anchors_grid), 4), dtype=np.float32)
@@ -208,7 +210,7 @@ class Yolo_loss(nn.Module):
             truth_box[:n, 0] = truth_x_all[b, :n]
             truth_box[:n, 1] = truth_y_all[b, :n]
 
-            pred_ious = bboxes_iou(pred[b].view(-1, 4), truth_box, xyxy=False)
+            pred_ious = bboxes_iou(pred[b].reshape(-1,4), truth_box, xyxy=False)
             pred_best_iou, _ = pred_ious.max(dim=1)
             pred_best_iou = (pred_best_iou > self.ignore_thre)
             pred_best_iou = pred_best_iou.view(pred[b].shape[:3])
@@ -282,9 +284,9 @@ def collate(batch):
         bboxes.append([box])
     images = np.concatenate(images, axis=0)
     images = images.transpose(0, 3, 1, 2)
-    images = torch.from_numpy(images).div(255.0)
+    images = torch.from_numpy(images).div(255.0).contiguous()
     bboxes = np.concatenate(bboxes, axis=0)
-    bboxes = torch.from_numpy(bboxes)
+    bboxes = torch.from_numpy(bboxes).contiguous()
     return images, bboxes
 
 
@@ -301,7 +303,10 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=8,
                             pin_memory=True, drop_last=True, collate_fn=val_collate)
 
-    writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
+    start_time = datetime.datetime.now().strftime('%m-%d_%H-%M')
+    writer_dir = os.path.join(config.TRAIN_TENSORBOARD_DIR, Path(config.cfgfile).stem, start_time)
+
+    writer = SummaryWriter(log_dir=writer_dir,
                            filename_suffix=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}',
                            comment=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}')
     # writer.add_images('legend',
@@ -478,9 +483,9 @@ def evaluate(model, data_loader, cfg, device, logger=None, **kwargs):
         model_input = [[cv2.resize(img, (cfg.w, cfg.h))] for img in images]
         model_input = np.concatenate(model_input, axis=0)
         model_input = model_input.transpose(0, 3, 1, 2)
-        model_input = torch.from_numpy(model_input).div(255.0)
+        model_input = torch.from_numpy(model_input).div(255.0).contiguous()
         model_input = model_input.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets = [{k: v.to(device).contiguous() for k, v in t.items()} for t in targets]
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -514,6 +519,7 @@ def evaluate(model, data_loader, cfg, device, logger=None, **kwargs):
                 "scores": scores,
                 "labels": labels,
             }
+
         evaluator_time = time.time()
         coco_evaluator.update(res)
         evaluator_time = time.time() - evaluator_time
@@ -540,11 +546,11 @@ def get_args(**kwargs):
                         help='Load model from a .pth file')
     parser.add_argument('-g', '--gpu', metavar='G', type=str, default='-1',
                         help='GPU', dest='gpu')
-    parser.add_argument('-dir', '--data-dir', type=str, default=None,
+    parser.add_argument('-dir', '--data-dir', type=str, default='',
                         help='dataset dir', dest='dataset_dir')
     parser.add_argument('-pretrained', type=str, default=None, help='pretrained yolov4.conv.137')
     parser.add_argument('-classes', type=int, default=80, help='dataset classes')
-    parser.add_argument('-train_label_path', dest='train_label', type=str, default='train.txt', help="train label path")
+    parser.add_argument('-train_label_path', dest='train_label', type=str, default='data/train.txt', help="train label path")
     parser.add_argument(
         '-optimizer', type=str, default='adam',
         help='training optimizer',
@@ -609,7 +615,7 @@ def _get_date_str():
 if __name__ == "__main__":
     logging = init_logger(log_dir='log')
     cfg = get_args(**Cfg)
-    os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
+    #os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
